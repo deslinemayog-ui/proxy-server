@@ -87,7 +87,8 @@
     input[type="text"],
     input[type="password"],
     input[type="number"],
-    input[type="url"] {
+    input[type="url"],
+    textarea {
       width: 100%;
       padding: 0.55rem 0.75rem;
       background: var(--input-bg);
@@ -95,8 +96,9 @@
       border-radius: 8px;
       color: var(--text);
       font-size: 0.9rem;
+      font-family: inherit;
     }
-    input:focus {
+    input:focus, textarea:focus {
       outline: none;
       border-color: var(--accent);
     }
@@ -169,6 +171,11 @@
           <label for="targetUrl">Reverse Proxy Target URL (optional)</label>
           <input type="url" id="targetUrl" name="targetUrl" placeholder="https://api.example.com" />
           <span class="hint">Leave empty for forward-proxy-only mode. When set, relative requests are forwarded here.</span>
+        </div>
+        <div class="field">
+          <label for="upstreamProxies">Upstream Proxies (optional, one ip:port per line)</label>
+          <textarea id="upstreamProxies" name="upstreamProxies" rows="3" placeholder="194.150.110.134:80&#10;51.75.206.209:80"></textarea>
+          <span class="hint">When set, forward proxy traffic rotates round-robin through these upstream HTTP proxies.</span>
         </div>
       </div>
 
@@ -276,6 +283,7 @@
       currentConfig = await res.json();
       document.getElementById('enableForwardProxy').checked = currentConfig.enableForwardProxy;
       document.getElementById('targetUrl').value = currentConfig.targetUrl || '';
+      document.getElementById('upstreamProxies').value = (currentConfig.upstreamProxies || []).join('\n');
       document.getElementById('proxyUsername').value = currentConfig.proxyUsername || '';
       document.getElementById('blockMetadata').checked = currentConfig.blockMetadata;
       document.getElementById('requestTimeoutMs').value = currentConfig.requestTimeoutMs;
@@ -306,6 +314,7 @@
         const payload = {
           enableForwardProxy: document.getElementById('enableForwardProxy').checked,
           targetUrl: document.getElementById('targetUrl').value.trim(),
+          upstreamProxies: document.getElementById('upstreamProxies').value,
           proxyUsername: document.getElementById('proxyUsername').value.trim(),
           proxyPassword: document.getElementById('proxyPassword').value,
           clearProxyAuth: document.getElementById('clearProxyAuth').checked,

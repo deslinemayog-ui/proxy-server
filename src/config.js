@@ -59,6 +59,8 @@ export function normalizeConfig(raw) {
     ? raw.adminPassword
     : null;
 
+  const upstreamProxies = parseUpstreamProxies(raw.upstreamProxies);
+
   return {
     port,
     host,
@@ -69,7 +71,38 @@ export function normalizeConfig(raw) {
     proxyAuth: proxyUsername ? { username: proxyUsername, password: proxyPassword } : null,
     blockMetadata,
     adminPassword,
+    upstreamProxies,
   };
+}
+
+/**
+ * Parse upstream proxies from an array or comma/newline-separated string of `host:port` (or `http://host:port`).
+ * @param {unknown} input
+ * @returns {Array<{ host: string, port: number }>}
+ */
+export function parseUpstreamProxies(input) {
+  if (!input) return [];
+  const items = Array.isArray(input)
+    ? input
+    : String(input).split(/[\n,]+/);
+
+  const proxies = [];
+  for (const rawItem of items) {
+    const trimmed = String(rawItem).trim();
+    if (!trimmed) continue;
+
+    const normalized = trimmed.includes('://') ? trimmed : `http://${trimmed}`;
+    const parsed = new URL(normalized);
+    if (parsed.protocol !== 'http:') {
+      throw new Error(`Unsupported upstream proxy protocol: ${parsed.protocol}`);
+    }
+    const port = Number.parseInt(parsed.port || '80', 10);
+    if (!parsed.hostname || !Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`Invalid upstream proxy entry: ${trimmed}`);
+    }
+    proxies.push({ host: parsed.hostname, port });
+  }
+  return proxies;
 }
 
 /**
@@ -104,6 +137,7 @@ export function loadConfig(env = process.env, options = {}) {
     proxyPassword: fileConfig.proxyPassword ?? env.PROXY_PASSWORD,
     blockMetadata: fileConfig.blockMetadata ?? env.BLOCK_METADATA,
     adminPassword: fileConfig.adminPassword ?? env.ADMIN_PASSWORD,
+    upstreamProxies: fileConfig.upstreamProxies ?? env.UPSTREAM_PROXIES,
   });
 }
 
@@ -127,6 +161,7 @@ export function saveConfig(raw, options = {}) {
     proxyPassword: normalized.proxyAuth?.password ?? '',
     blockMetadata: normalized.blockMetadata,
     adminPassword: normalized.adminPassword ?? '',
+    upstreamProxies: normalized.upstreamProxies.map((p) => `${p.host}:${p.port}`),
   };
 
   writeFileSync(configPath, `${JSON.stringify(serializable, null, 2)}\n`, 'utf8');
@@ -149,5 +184,6 @@ export function serializeConfigForUi(config) {
     hasProxyPassword: Boolean(config.proxyAuth?.password),
     blockMetadata: config.blockMetadata,
     hasAdminPassword: Boolean(config.adminPassword),
+    upstreamProxies: config.upstreamProxies.map((p) => `${p.host}:${p.port}`),
   };
 }

@@ -110,39 +110,55 @@ function applyCorsHeaders(res, corsOrigin) {
 }
 
 /**
- * Forward an HTTP/HTTPS request to `destinationUrl`.
+ * Forward an HTTP/HTTPS request to `destinationUrl` (directly or via an upstream HTTP proxy).
  * @param {http.IncomingMessage} req
  * @param {http.ServerResponse} res
  * @param {URL} destinationUrl
  * @param {object} headers
  * @param {ReturnType<import('./config.js').loadConfig>} config
  * @param {{ info: Function, error: Function }} logger
+ * @param {{ host: string, port: number } | null} [upstreamProxy=null]
  */
-function forwardRequest(req, res, destinationUrl, headers, config, logger) {
-  const transport = destinationUrl.protocol === 'https:' ? https : http;
+function forwardRequest(req, res, destinationUrl, headers, config, logger, upstreamProxy = null) {
+  const transport = upstreamProxy ? http : (destinationUrl.protocol === 'https:' ? https : http);
   const startedAt = Date.now();
   let timedOut = false;
 
-  const proxyReq = transport.request(
-    destinationUrl,
-    {
-      method: req.method,
-      headers,
-    },
-    (proxyRes) => {
-      const responseHeaders = stripHopByHopHeaders(proxyRes.headers);
-      if (config.corsOrigin) {
-        responseHeaders['access-control-allow-origin'] = config.corsOrigin;
+  const requestTarget = upstreamProxy
+    ? {
+        host: upstreamProxy.host,
+        port: upstreamProxy.port,
+        path: destinationUrl.href,
+        method: req.method,
+        headers,
       }
+    : destinationUrl;
 
-      res.writeHead(proxyRes.statusCode ?? 502, proxyRes.statusMessage, responseHeaders);
-      proxyRes.pipe(res);
+  const requestOptions = upstreamProxy
+    ? requestTarget
+    : {
+        method: req.method,
+        headers,
+      };
 
-      proxyRes.on('end', () => {
-        logger.info(`${req.method} ${req.url} -> ${destinationUrl.href} [${proxyRes.statusCode}] ${Date.now() - startedAt}ms`);
-      });
+  const proxyReq = upstreamProxy
+    ? transport.request(requestOptions, handleResponse)
+    : transport.request(destinationUrl, requestOptions, handleResponse);
+
+  function handleResponse(proxyRes) {
+    const responseHeaders = stripHopByHopHeaders(proxyRes.headers);
+    if (config.corsOrigin) {
+      responseHeaders['access-control-allow-origin'] = config.corsOrigin;
     }
-  );
+
+    res.writeHead(proxyRes.statusCode ?? 502, proxyRes.statusMessage, responseHeaders);
+    proxyRes.pipe(res);
+
+    proxyRes.on('end', () => {
+      const via = upstreamProxy ? ` via ${upstreamProxy.host}:${upstreamProxy.port}` : '';
+      logger.info(`${req.method} ${req.url} -> ${destinationUrl.href}${via} [${proxyRes.statusCode}] ${Date.now() - startedAt}ms`);
+    });
+  }
 
   proxyReq.setTimeout(config.requestTimeoutMs, () => {
     timedOut = true;
@@ -294,10 +310,19 @@ function parseAuthority(authority) {
  */
 export function createProxyServer(initialConfig, logger = console, options = {}) {
   let activeConfig = initialConfig;
+  let upstreamIndex = 0;
   const log = {
     info: logger.info ?? (() => {}),
     error: logger.error ?? (() => {}),
   };
+
+  function pickUpstreamProxy() {
+    const list = activeConfig.upstreamProxies;
+    if (!list || list.length === 0) return null;
+    const chosen = list[upstreamIndex % list.length];
+    upstreamIndex = (upstreamIndex + 1) % list.length;
+    return chosen;
+  }
 
   const server = http.createServer(async (req, res) => {
     const rawUrl = req.url ?? '/';
@@ -434,7 +459,7 @@ export function createProxyServer(initialConfig, logger = console, options = {})
 
       const headers = stripHopByHopHeaders(req.headers);
       headers.host = destinationUrl.host;
-      forwardRequest(req, res, destinationUrl, headers, activeConfig, log);
+      forwardRequest(req, res, destinationUrl, headers, activeConfig, log, pickUpstreamProxy());
       return;
     }
 
@@ -485,14 +510,60 @@ export function createProxyServer(initialConfig, logger = console, options = {})
       return;
     }
 
-    const upstreamSocket = net.connect(target.port, target.host, () => {
-      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-      if (head && head.length > 0) {
-        upstreamSocket.write(head);
+    const upstreamProxy = pickUpstreamProxy();
+    const connectHost = upstreamProxy ? upstreamProxy.host : target.host;
+    const connectPort = upstreamProxy ? upstreamProxy.port : target.port;
+
+    const upstreamSocket = net.connect(connectPort, connectHost, () => {
+      if (!upstreamProxy) {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head && head.length > 0) {
+          upstreamSocket.write(head);
+        }
+        upstreamSocket.pipe(clientSocket);
+        clientSocket.pipe(upstreamSocket);
+        log.info(`CONNECT ${target.host}:${target.port}`);
+        return;
       }
-      upstreamSocket.pipe(clientSocket);
-      clientSocket.pipe(upstreamSocket);
-      log.info(`CONNECT ${target.host}:${target.port}`);
+
+      // Chain CONNECT through the selected upstream HTTP proxy
+      upstreamSocket.write(
+        `CONNECT ${target.host}:${target.port} HTTP/1.1\r\nHost: ${target.host}:${target.port}\r\n\r\n`
+      );
+
+      let responseBuffer = Buffer.alloc(0);
+      const onUpstreamData = (chunk) => {
+        responseBuffer = Buffer.concat([responseBuffer, chunk]);
+        const headerEnd = responseBuffer.indexOf('\r\n\r\n');
+        if (headerEnd === -1) return;
+
+        upstreamSocket.removeListener('data', onUpstreamData);
+        const headerText = responseBuffer.subarray(0, headerEnd).toString('utf8');
+        const statusLine = headerText.split('\r\n')[0] ?? '';
+        const statusCode = Number.parseInt(statusLine.split(' ')[1] ?? '0', 10);
+
+        if (statusCode !== 200) {
+          log.error(`Upstream proxy ${upstreamProxy.host}:${upstreamProxy.port} rejected CONNECT (${statusLine})`);
+          clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+          clientSocket.destroy();
+          upstreamSocket.destroy();
+          return;
+        }
+
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        const leftover = responseBuffer.subarray(headerEnd + 4);
+        if (leftover.length > 0) {
+          clientSocket.write(leftover);
+        }
+        if (head && head.length > 0) {
+          upstreamSocket.write(head);
+        }
+        upstreamSocket.pipe(clientSocket);
+        clientSocket.pipe(upstreamSocket);
+        log.info(`CONNECT ${target.host}:${target.port} via ${upstreamProxy.host}:${upstreamProxy.port}`);
+      };
+
+      upstreamSocket.on('data', onUpstreamData);
     });
 
     upstreamSocket.setTimeout(activeConfig.requestTimeoutMs, () => {

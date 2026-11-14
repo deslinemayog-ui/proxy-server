@@ -444,5 +444,95 @@ describe('proxy-server', () => {
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it('chains forward HTTP and CONNECT requests round-robin through upstreamProxies', async () => {
+    const hits = [];
+
+    function createMockUpstreamProxy(name) {
+      const s = http.createServer((req, res) => {
+        hits.push({ proxy: name, type: 'http', url: req.url });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ via: name, url: req.url }));
+      });
+      s.on('connect', (req, clientSocket) => {
+        hits.push({ proxy: name, type: 'connect', url: req.url });
+        const [host, port] = req.url.split(':');
+        const targetSocket = net.connect(Number(port), host, () => {
+          clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          targetSocket.pipe(clientSocket);
+          clientSocket.pipe(targetSocket);
+        });
+        targetSocket.on('error', () => clientSocket.destroy());
+      });
+      return s;
+    }
+
+    const up1 = createMockUpstreamProxy('up1');
+    const up2 = createMockUpstreamProxy('up2');
+    const up1Port = await listen(up1);
+    const up2Port = await listen(up2);
+
+    const config = loadConfig({
+      PORT: '0',
+      ENABLE_FORWARD_PROXY: 'true',
+      UPSTREAM_PROXIES: `127.0.0.1:${up1Port},127.0.0.1:${up2Port}`,
+    });
+    const proxy = createProxyServer(config, silentLogger);
+    const proxyPort = await listen(proxy);
+
+    const sendViaProxy = (targetPath) =>
+      new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            host: '127.0.0.1',
+            port: proxyPort,
+            method: 'GET',
+            path: `http://example.test${targetPath}`,
+          },
+          (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString())));
+          }
+        );
+        req.on('error', reject);
+        req.end();
+      });
+
+    try {
+      const r1 = await sendViaProxy('/one');
+      const r2 = await sendViaProxy('/two');
+      assert.equal(r1.via, 'up1');
+      assert.equal(r2.via, 'up2');
+
+      // CONNECT tunnel should chain through up1 (round-robin) to upstreamServer
+      const tunnelOut = await new Promise((resolve, reject) => {
+        const socket = net.connect(proxyPort, '127.0.0.1', () => {
+          socket.write(`CONNECT 127.0.0.1:${upstreamPort} HTTP/1.1\r\nHost: 127.0.0.1:${upstreamPort}\r\n\r\n`);
+        });
+        let established = false;
+        let buf = '';
+        socket.on('data', (chunk) => {
+          buf += chunk.toString('utf8');
+          if (!established && buf.includes('\r\n\r\n')) {
+            established = true;
+            buf = '';
+            socket.write(`GET /chained HTTP/1.1\r\nHost: 127.0.0.1:${upstreamPort}\r\nConnection: close\r\n\r\n`);
+          } else if (established && buf.includes('"url":"/chained"')) {
+            socket.end();
+            resolve(buf);
+          }
+        });
+        socket.on('error', reject);
+      });
+
+      assert.match(tunnelOut, /"url":"\/chained"/);
+      assert.equal(hits.some((h) => h.proxy === 'up1' && h.type === 'connect'), true);
+    } finally {
+      await close(proxy);
+      await close(up1);
+      await close(up2);
+    }
+  });
 });
 

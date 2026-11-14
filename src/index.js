@@ -15,6 +15,11 @@ server.listen(config.port, config.host, () => {
   if (config.enableForwardProxy) {
     console.log('  Forward proxy (HTTP + HTTPS CONNECT): enabled');
   }
+  if (config.upstreamProxies.length > 0) {
+    console.log(
+      `  Upstream proxies (${config.upstreamProxies.length}): ${config.upstreamProxies.map((p) => `${p.host}:${p.port}`).join(', ')}`
+    );
+  }
 });
 
 function shutdown(signal) {
