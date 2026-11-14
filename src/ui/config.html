@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Proxy Server Configuration</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-hover: #0ea5e9;
+      --success: #22c55e;
+      --danger: #ef4444;
+      --input-bg: #0f172a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 2rem 1rem;
+    }
+    .container {
+      max-width: 760px;
+      margin: 0 auto;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1.5rem;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+    h1 {
+      margin: 0;
+      font-size: 1.5rem;
+      font-weight: 600;
+    }
+    .badge {
+      font-size: 0.8rem;
+      padding: 0.25rem 0.65rem;
+      border-radius: 999px;
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 1.25rem;
+    }
+    .card h2 {
+      margin: 0 0 1rem 0;
+      font-size: 1.05rem;
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1rem;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      margin-bottom: 0.9rem;
+    }
+    .field:last-child { margin-bottom: 0; }
+    label {
+      font-size: 0.875rem;
+      font-weight: 500;
+    }
+    .hint {
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    input[type="text"],
+    input[type="password"],
+    input[type="number"],
+    input[type="url"] {
+      width: 100%;
+      padding: 0.55rem 0.75rem;
+      background: var(--input-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.9rem;
+    }
+    input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .toggle {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      cursor: pointer;
+      user-select: none;
+    }
+    .toggle input {
+      width: 1.1rem;
+      height: 1.1rem;
+      accent-color: var(--accent);
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    button {
+      background: var(--accent);
+      color: #0f172a;
+      border: none;
+      border-radius: 8px;
+      padding: 0.65rem 1.25rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .status {
+      font-size: 0.9rem;
+      font-weight: 500;
+    }
+    .status.ok { color: var(--success); }
+    .status.err { color: var(--danger); }
+    pre {
+      margin: 0;
+      padding: 0.85rem;
+      background: var(--input-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 0.85rem;
+      color: #e2e8f0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Proxy Server Configuration</h1>
+      <span class="badge" id="modeBadge">Loading...</span>
+    </header>
+
+    <form id="configForm">
+      <div class="card">
+        <h2>Proxy Mode</h2>
+        <div class="field">
+          <label class="toggle">
+            <input type="checkbox" id="enableForwardProxy" name="enableForwardProxy" />
+            <span>Enable Forward Proxy (HTTP &amp; HTTPS CONNECT tunneling for clients)</span>
+          </label>
+          <span class="hint">Enable this when routing client traffic through your Google Cloud VM.</span>
+        </div>
+        <div class="field">
+          <label for="targetUrl">Reverse Proxy Target URL (optional)</label>
+          <input type="url" id="targetUrl" name="targetUrl" placeholder="https://api.example.com" />
+          <span class="hint">Leave empty for forward-proxy-only mode. When set, relative requests are forwarded here.</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Client Authentication (Forward Proxy)</h2>
+        <div class="grid">
+          <div class="field">
+            <label for="proxyUsername">Proxy Username</label>
+            <input type="text" id="proxyUsername" name="proxyUsername" autocomplete="off" placeholder="client-user" />
+          </div>
+          <div class="field">
+            <label for="proxyPassword">Proxy Password</label>
+            <input type="password" id="proxyPassword" name="proxyPassword" autocomplete="new-password" placeholder="Leave blank to keep existing" />
+            <span class="hint" id="proxyPasswordHint">Not set</span>
+          </div>
+        </div>
+        <div class="field">
+          <label class="toggle">
+            <input type="checkbox" id="clearProxyAuth" name="clearProxyAuth" />
+            <span>Clear proxy authentication credentials</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Security &amp; Networking</h2>
+        <div class="field">
+          <label class="toggle">
+            <input type="checkbox" id="blockMetadata" name="blockMetadata" />
+            <span>Block Cloud Metadata Endpoints (169.254.169.254 / metadata.google.internal)</span>
+          </label>
+          <span class="hint">Recommended on Google Cloud VMs to protect instance credentials.</span>
+        </div>
+        <div class="grid">
+          <div class="field">
+            <label for="requestTimeoutMs">Request Timeout (ms)</label>
+            <input type="number" id="requestTimeoutMs" name="requestTimeoutMs" min="100" step="100" required />
+          </div>
+          <div class="field">
+            <label for="corsOrigin">CORS Allow-Origin (optional)</label>
+            <input type="text" id="corsOrigin" name="corsOrigin" placeholder="* or https://app.example.com" />
+          </div>
+        </div>
+        <div class="grid">
+          <div class="field">
+            <label for="host">Bind Host (restart required)</label>
+            <input type="text" id="host" name="host" required />
+          </div>
+          <div class="field">
+            <label for="port">Bind Port (restart required)</label>
+            <input type="number" id="port" name="port" min="1" max="65535" required />
+          </div>
+        </div>
+        <div class="field">
+          <label for="adminPassword">Config UI Admin Password (optional)</label>
+          <input type="password" id="adminPassword" name="adminPassword" autocomplete="new-password" placeholder="Leave blank to keep existing" />
+          <span class="hint" id="adminPasswordHint">If set, protects /config and /api/config with HTTP Basic auth (any username, this password).</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Client Test Command</h2>
+        <pre id="clientSnippet">curl -x http://localhost:8080 https://api.ipify.org</pre>
+      </div>
+
+      <div class="actions">
+        <button type="submit" id="saveBtn">Save Configuration</button>
+        <span class="status" id="statusMsg"></span>
+      </div>
+    </form>
+  </div>
+
+  <script>
+    const form = document.getElementById('configForm');
+    const statusMsg = document.getElementById('statusMsg');
+    const modeBadge = document.getElementById('modeBadge');
+    const clientSnippet = document.getElementById('clientSnippet');
+    const proxyPasswordHint = document.getElementById('proxyPasswordHint');
+    const adminPasswordHint = document.getElementById('adminPasswordHint');
+    let currentConfig = null;
+
+    function updatePreview() {
+      const host = window.location.hostname || 'VM_EXTERNAL_IP';
+      const port = document.getElementById('port').value || '8080';
+      const user = document.getElementById('proxyUsername').value.trim();
+      const hasPass = Boolean(document.getElementById('proxyPassword').value) || (currentConfig?.hasProxyPassword && !document.getElementById('clearProxyAuth').checked);
+      const authPart = user && hasPass ? `${encodeURIComponent(user)}:YOUR_PASSWORD@` : '';
+      clientSnippet.textContent = `curl -x http://${authPart}${host}:${port} https://api.ipify.org`;
+
+      const fwd = document.getElementById('enableForwardProxy').checked;
+      const rev = Boolean(document.getElementById('targetUrl').value.trim());
+      if (fwd && rev) modeBadge.textContent = 'Forward + Reverse Proxy';
+      else if (fwd) modeBadge.textContent = 'Forward Proxy';
+      else if (rev) modeBadge.textContent = 'Reverse Proxy';
+      else modeBadge.textContent = 'Unconfigured';
+    }
+
+    async function load() {
+      const res = await fetch('/api/config');
+      if (!res.ok) {
+        statusMsg.textContent = 'Failed to load configuration';
+        statusMsg.className = 'status err';
+        return;
+      }
+      currentConfig = await res.json();
+      document.getElementById('enableForwardProxy').checked = currentConfig.enableForwardProxy;
+      document.getElementById('targetUrl').value = currentConfig.targetUrl || '';
+      document.getElementById('proxyUsername').value = currentConfig.proxyUsername || '';
+      document.getElementById('blockMetadata').checked = currentConfig.blockMetadata;
+      document.getElementById('requestTimeoutMs').value = currentConfig.requestTimeoutMs;
+      document.getElementById('corsOrigin').value = currentConfig.corsOrigin || '';
+      document.getElementById('host').value = currentConfig.host;
+      document.getElementById('port').value = currentConfig.port;
+
+      proxyPasswordHint.textContent = currentConfig.hasProxyPassword
+        ? 'Password is currently set. Leave blank to keep it.'
+        : 'No password set.';
+      adminPasswordHint.textContent = currentConfig.hasAdminPassword
+        ? 'Admin password is set. Leave blank to keep it.'
+        : 'Not set. Set one to protect /config on a public VM.';
+
+      updatePreview();
+    }
+
+    form.addEventListener('input', updatePreview);
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      statusMsg.textContent = 'Saving...';
+      statusMsg.className = 'status';
+      const saveBtn = document.getElementById('saveBtn');
+      saveBtn.disabled = true;
+
+      try {
+        const payload = {
+          enableForwardProxy: document.getElementById('enableForwardProxy').checked,
+          targetUrl: document.getElementById('targetUrl').value.trim(),
+          proxyUsername: document.getElementById('proxyUsername').value.trim(),
+          proxyPassword: document.getElementById('proxyPassword').value,
+          clearProxyAuth: document.getElementById('clearProxyAuth').checked,
+          blockMetadata: document.getElementById('blockMetadata').checked,
+          requestTimeoutMs: Number(document.getElementById('requestTimeoutMs').value),
+          corsOrigin: document.getElementById('corsOrigin').value.trim(),
+          host: document.getElementById('host').value.trim(),
+          port: Number(document.getElementById('port').value),
+          adminPassword: document.getElementById('adminPassword').value,
+        };
+
+        const res = await fetch('/api/config', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Failed to save');
+        }
+
+        currentConfig = data.config;
+        document.getElementById('proxyPassword').value = '';
+        document.getElementById('adminPassword').value = '';
+        document.getElementById('clearProxyAuth').checked = false;
+        proxyPasswordHint.textContent = currentConfig.hasProxyPassword
+          ? 'Password is currently set. Leave blank to keep it.'
+          : 'No password set.';
+        adminPasswordHint.textContent = currentConfig.hasAdminPassword
+          ? 'Admin password is set. Leave blank to keep it.'
+          : 'Not set. Set one to protect /config on a public VM.';
+        updatePreview();
+
+        statusMsg.textContent = data.restartRequired
+          ? 'Saved! Restart server for port/host changes to take effect.'
+          : 'Saved and applied live!';
+        statusMsg.className = 'status ok';
+      } catch (err) {
+        statusMsg.textContent = err.message;
+        statusMsg.className = 'status err';
+      } finally {
+        saveBtn.disabled = false;
+      }
+    });
+
+    load();
+  </script>
+</body>
+</html>
+

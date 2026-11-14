@@ -1,0 +1,21 @@
+[Unit]
+Description=Node.js Proxy Server
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/proxy-server
+EnvironmentFile=/opt/proxy-server/.env
+ExecStart=/usr/bin/node /opt/proxy-server/src/index.js
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+
