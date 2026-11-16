@@ -173,8 +173,8 @@
           <span class="hint">Leave empty for forward-proxy-only mode. When set, relative requests are forwarded here.</span>
         </div>
         <div class="field">
-          <label for="upstreamProxies">Upstream Proxies (optional, one ip:port per line)</label>
-          <textarea id="upstreamProxies" name="upstreamProxies" rows="3" placeholder="194.150.110.134:80&#10;51.75.206.209:80"></textarea>
+          <label for="upstreamProxies">Upstream Proxies / Gateways (optional, one per line: <code>ip:port</code> or <code>http(s)://user:pass@host:port#CC</code>)</label>
+          <textarea id="upstreamProxies" name="upstreamProxies" rows="3" placeholder="http://user-country-{country}-session-{session}:pass@gate.example.com:7000&#10;https://user:pass@194.150.110.134:443#US&#10;51.75.206.209:80"></textarea>
           <span class="hint">When set, forward proxy traffic rotates round-robin through these upstream HTTP proxies.</span>
         </div>
       </div>

@@ -76,9 +76,35 @@ export function normalizeConfig(raw) {
 }
 
 /**
- * Parse upstream proxies from an array or comma/newline-separated string of `host:port` (or `http://host:port`).
+ * Format a normalized upstream proxy object back to string form.
+ * @param {{ protocol: string, host: string, port: number, username: string | null, password: string | null, country: string | null }} proxy
+ * @param {{ maskPassword?: boolean }} [options]
+ */
+export function formatUpstreamProxy(proxy, options = {}) {
+  const { maskPassword = false } = options;
+  const hasAuth = proxy.username !== null || proxy.password !== null;
+  if (proxy.protocol === 'http:' && !hasAuth && !proxy.country) {
+    return `${proxy.host}:${proxy.port}`;
+  }
+
+  let auth = '';
+  if (hasAuth) {
+    const user = encodeURIComponent(proxy.username ?? '');
+    const pass = proxy.password !== null
+      ? (maskPassword ? '***' : encodeURIComponent(proxy.password))
+      : '';
+    auth = proxy.password !== null ? `${user}:${pass}@` : `${user}@`;
+  }
+
+  const fragment = proxy.country ? `#${proxy.country}` : '';
+  return `${proxy.protocol}//${auth}${proxy.host}:${proxy.port}${fragment}`;
+}
+
+/**
+ * Parse upstream proxies from an array or comma/newline-separated string.
+ * Supports `host:port`, `http://[user:pass@]host:port[#CC]`, and `https://[user:pass@]host:port[#CC]`.
  * @param {unknown} input
- * @returns {Array<{ host: string, port: number }>}
+ * @returns {Array<{ protocol: 'http:' | 'https:', host: string, port: number, username: string | null, password: string | null, country: string | null }>}
  */
 export function parseUpstreamProxies(input) {
   if (!input) return [];
@@ -93,14 +119,27 @@ export function parseUpstreamProxies(input) {
 
     const normalized = trimmed.includes('://') ? trimmed : `http://${trimmed}`;
     const parsed = new URL(normalized);
-    if (parsed.protocol !== 'http:') {
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       throw new Error(`Unsupported upstream proxy protocol: ${parsed.protocol}`);
     }
-    const port = Number.parseInt(parsed.port || '80', 10);
+    const defaultPort = parsed.protocol === 'https:' ? '443' : '80';
+    const port = Number.parseInt(parsed.port || defaultPort, 10);
     if (!parsed.hostname || !Number.isInteger(port) || port < 1 || port > 65535) {
       throw new Error(`Invalid upstream proxy entry: ${trimmed}`);
     }
-    proxies.push({ host: parsed.hostname, port });
+
+    const hasUser = parsed.username !== '';
+    const hasPass = parsed.password !== '';
+    const country = parsed.hash ? parsed.hash.slice(1).trim().toUpperCase() || null : null;
+
+    proxies.push({
+      protocol: parsed.protocol,
+      host: parsed.hostname,
+      port,
+      username: hasUser || hasPass ? decodeURIComponent(parsed.username) : null,
+      password: hasPass ? decodeURIComponent(parsed.password) : (hasUser ? '' : null),
+      country,
+    });
   }
   return proxies;
 }
@@ -161,7 +200,7 @@ export function saveConfig(raw, options = {}) {
     proxyPassword: normalized.proxyAuth?.password ?? '',
     blockMetadata: normalized.blockMetadata,
     adminPassword: normalized.adminPassword ?? '',
-    upstreamProxies: normalized.upstreamProxies.map((p) => `${p.host}:${p.port}`),
+    upstreamProxies: normalized.upstreamProxies.map((p) => formatUpstreamProxy(p)),
   };
 
   writeFileSync(configPath, `${JSON.stringify(serializable, null, 2)}\n`, 'utf8');
@@ -184,6 +223,6 @@ export function serializeConfigForUi(config) {
     hasProxyPassword: Boolean(config.proxyAuth?.password),
     blockMetadata: config.blockMetadata,
     hasAdminPassword: Boolean(config.adminPassword),
-    upstreamProxies: config.upstreamProxies.map((p) => `${p.host}:${p.port}`),
+    upstreamProxies: config.upstreamProxies.map((p) => formatUpstreamProxy(p, { maskPassword: true })),
   };
 }

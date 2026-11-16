@@ -1,10 +1,10 @@
-import { timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import tls from 'node:tls';
-import { saveConfig, serializeConfigForUi } from './config.js';
+import { formatUpstreamProxy, parseUpstreamProxies, saveConfig, serializeConfigForUi } from './config.js';
 
 const CONFIG_HTML = readFileSync(new URL('./ui/config.html', import.meta.url), 'utf8');
 
@@ -110,19 +110,174 @@ function applyCorsHeaders(res, corsOrigin) {
 }
 
 /**
- * Forward an HTTP/HTTPS request to `destinationUrl` (directly or via an upstream HTTP proxy).
+ * Build a `Basic ...` Proxy-Authorization header value for an upstream proxy, if credentials exist.
+ * @param {{ username: string | null, password: string | null } | null} upstreamProxy
+ */
+function buildUpstreamAuthHeader(upstreamProxy) {
+  if (!upstreamProxy || upstreamProxy.username === null) return null;
+  const token = Buffer.from(`${upstreamProxy.username}:${upstreamProxy.password ?? ''}`).toString('base64');
+  return `Basic ${token}`;
+}
+
+/**
+ * Read a request body into a Buffer up to `maxBytes` so failed upstream proxy attempts can be retried.
+ * @param {http.IncomingMessage} req
+ * @param {number} [maxBytes=1048576]
+ */
+function readRequestBuffer(req, maxBytes = 1048576) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(new Error('Request body too large for retry buffering'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+/**
+ * Forward an HTTP/HTTPS request through a prioritized list of upstream proxies with automatic failover.
  * @param {http.IncomingMessage} req
  * @param {http.ServerResponse} res
  * @param {URL} destinationUrl
  * @param {object} headers
  * @param {ReturnType<import('./config.js').loadConfig>} config
  * @param {{ info: Function, error: Function }} logger
- * @param {{ host: string, port: number } | null} [upstreamProxy=null]
+ * @param {Array<{ raw: any, resolved: any }>} candidates
+ * @param {{ markFailure: Function, markSuccess: Function }} healthTracker
+ */
+async function forwardViaUpstreamPool(req, res, destinationUrl, headers, config, logger, candidates, healthTracker) {
+  let bodyBuffer = Buffer.alloc(0);
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    try {
+      bodyBuffer = await readRequestBuffer(req);
+    } catch (err) {
+      sendJsonError(res, 413, err.message);
+      return;
+    }
+  }
+
+  let clientAborted = false;
+  req.on('aborted', () => {
+    clientAborted = true;
+  });
+
+  const maxAttempts = Math.min(candidates.length, 5);
+  let lastTimedOut = false;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    if (clientAborted || res.writableEnded) return;
+    const { raw, resolved: upstreamProxy } = candidates[i];
+    const startedAt = Date.now();
+
+    const result = await new Promise((resolveAttempt) => {
+      const transport = upstreamProxy.protocol === 'https:' ? https : http;
+      const outgoingHeaders = { ...headers };
+      const upstreamAuth = buildUpstreamAuthHeader(upstreamProxy);
+      if (upstreamAuth) {
+        outgoingHeaders['proxy-authorization'] = upstreamAuth;
+      }
+
+      let timedOut = false;
+      let settled = false;
+      const finish = (outcome) => {
+        if (settled) return;
+        settled = true;
+        resolveAttempt(outcome);
+      };
+
+      const proxyReq = transport.request(
+        {
+          host: upstreamProxy.host,
+          port: upstreamProxy.port,
+          path: destinationUrl.href,
+          method: req.method,
+          headers: outgoingHeaders,
+          agent: false,
+        },
+        (proxyRes) => {
+          const status = proxyRes.statusCode ?? 502;
+          if ((status === 407 || status === 502) && i < maxAttempts - 1) {
+            proxyRes.resume();
+            healthTracker.markFailure(raw, `HTTP ${status}`);
+            logger.error(`Upstream proxy ${upstreamProxy.host}:${upstreamProxy.port} returned ${status}, failing over`);
+            finish({ retry: true, timedOut: false });
+            return;
+          }
+
+          healthTracker.markSuccess(raw);
+          const responseHeaders = stripHopByHopHeaders(proxyRes.headers);
+          if (config.corsOrigin) {
+            responseHeaders['access-control-allow-origin'] = config.corsOrigin;
+          }
+
+          res.writeHead(status, proxyRes.statusMessage, responseHeaders);
+          proxyRes.pipe(res);
+          proxyRes.on('end', () => {
+            logger.info(`${req.method} ${req.url} -> ${destinationUrl.href} via ${upstreamProxy.host}:${upstreamProxy.port} [${status}] ${Date.now() - startedAt}ms`);
+            finish({ retry: false });
+          });
+          proxyRes.on('error', () => finish({ retry: false }));
+        }
+      );
+
+      proxyReq.setTimeout(config.requestTimeoutMs, () => {
+        timedOut = true;
+        proxyReq.destroy(new Error('Upstream request timed out'));
+      });
+
+      proxyReq.on('error', (err) => {
+        healthTracker.markFailure(raw, err.message);
+        logger.error(`Upstream proxy ${upstreamProxy.host}:${upstreamProxy.port} failed for ${req.method} ${destinationUrl.href}: ${err.message}`);
+        finish({ retry: true, timedOut });
+      });
+
+      if (bodyBuffer.length > 0) {
+        proxyReq.write(bodyBuffer);
+      }
+      proxyReq.end();
+    });
+
+    lastTimedOut = Boolean(result.timedOut);
+    if (!result.retry) return;
+  }
+
+  if (lastTimedOut) {
+    sendJsonError(res, 504, 'Gateway Timeout');
+  } else {
+    sendJsonError(res, 502, 'Bad Gateway');
+  }
+}
+
+/**
+ * Forward an HTTP/HTTPS request directly to `destinationUrl`.
+ * @param {http.IncomingMessage} req
+ * @param {http.ServerResponse} res
+ * @param {URL} destinationUrl
+ * @param {object} headers
+ * @param {ReturnType<import('./config.js').loadConfig>} config
+ * @param {{ info: Function, error: Function }} logger
+ * @param {{ protocol: 'http:' | 'https:', host: string, port: number, username: string | null, password: string | null } | null} [upstreamProxy=null]
  */
 function forwardRequest(req, res, destinationUrl, headers, config, logger, upstreamProxy = null) {
-  const transport = upstreamProxy ? http : (destinationUrl.protocol === 'https:' ? https : http);
+  const transport = upstreamProxy
+    ? (upstreamProxy.protocol === 'https:' ? https : http)
+    : (destinationUrl.protocol === 'https:' ? https : http);
   const startedAt = Date.now();
   let timedOut = false;
+
+  const outgoingHeaders = upstreamProxy ? { ...headers } : headers;
+  const upstreamAuth = buildUpstreamAuthHeader(upstreamProxy);
+  if (upstreamAuth) {
+    outgoingHeaders['proxy-authorization'] = upstreamAuth;
+  }
 
   const requestTarget = upstreamProxy
     ? {
@@ -130,7 +285,8 @@ function forwardRequest(req, res, destinationUrl, headers, config, logger, upstr
         port: upstreamProxy.port,
         path: destinationUrl.href,
         method: req.method,
-        headers,
+        headers: outgoingHeaders,
+        agent: false,
       }
     : destinationUrl;
 
@@ -138,7 +294,7 @@ function forwardRequest(req, res, destinationUrl, headers, config, logger, upstr
     ? requestTarget
     : {
         method: req.method,
-        headers,
+        headers: outgoingHeaders,
       };
 
   const proxyReq = upstreamProxy
@@ -299,6 +455,109 @@ function parseAuthority(authority) {
   return Number.isInteger(port) && port > 0 && port <= 65535 ? { host, port } : null;
 }
 
+const UPSTREAM_COOLDOWN_MS = 30000;
+
+/**
+ * Establish a CONNECT tunnel through a prioritized list of upstream proxies with automatic failover.
+ * @param {{ host: string, port: number }} target
+ * @param {net.Socket} clientSocket
+ * @param {Buffer} head
+ * @param {Array<{ raw: any, resolved: any }>} candidates
+ * @param {ReturnType<import('./config.js').loadConfig>} config
+ * @param {{ info: Function, error: Function }} log
+ * @param {{ markFailure: Function, markSuccess: Function }} healthTracker
+ */
+function connectViaUpstreamPool(target, clientSocket, head, candidates, config, log, healthTracker) {
+  const maxAttempts = Math.min(candidates.length, 5);
+  let attempt = 0;
+
+  function tryNext() {
+    if (clientSocket.destroyed) return;
+    if (attempt >= maxAttempts) {
+      clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+
+    const { raw, resolved: upstreamProxy } = candidates[attempt++];
+    const connectTransport = upstreamProxy.protocol === 'https:' ? tls : net;
+    const connectOptions = upstreamProxy.protocol === 'https:'
+      ? { host: upstreamProxy.host, port: upstreamProxy.port, servername: upstreamProxy.host }
+      : { host: upstreamProxy.host, port: upstreamProxy.port };
+
+    let settled = false;
+    const upstreamSocket = connectTransport.connect(connectOptions, () => {
+      let connectReq = `CONNECT ${target.host}:${target.port} HTTP/1.1\r\nHost: ${target.host}:${target.port}\r\n`;
+      const upstreamAuth = buildUpstreamAuthHeader(upstreamProxy);
+      if (upstreamAuth) {
+        connectReq += `Proxy-Authorization: ${upstreamAuth}\r\n`;
+      }
+      connectReq += '\r\n';
+      upstreamSocket.write(connectReq);
+
+      let responseBuffer = Buffer.alloc(0);
+      const onUpstreamData = (chunk) => {
+        responseBuffer = Buffer.concat([responseBuffer, chunk]);
+        const headerEnd = responseBuffer.indexOf('\r\n\r\n');
+        if (headerEnd === -1) return;
+
+        upstreamSocket.removeListener('data', onUpstreamData);
+        const headerText = responseBuffer.subarray(0, headerEnd).toString('utf8');
+        const statusLine = headerText.split('\r\n')[0] ?? '';
+        const statusCode = Number.parseInt(statusLine.split(' ')[1] ?? '0', 10);
+
+        if (statusCode !== 200) {
+          settled = true;
+          healthTracker.markFailure(raw, statusLine || `HTTP ${statusCode}`);
+          log.error(`Upstream proxy ${upstreamProxy.host}:${upstreamProxy.port} rejected CONNECT (${statusLine})`);
+          upstreamSocket.destroy();
+          tryNext();
+          return;
+        }
+
+        settled = true;
+        healthTracker.markSuccess(raw);
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        const leftover = responseBuffer.subarray(headerEnd + 4);
+        if (leftover.length > 0) {
+          clientSocket.write(leftover);
+        }
+        if (head && head.length > 0) {
+          upstreamSocket.write(head);
+        }
+        upstreamSocket.pipe(clientSocket);
+        clientSocket.pipe(upstreamSocket);
+        log.info(`CONNECT ${target.host}:${target.port} via ${upstreamProxy.host}:${upstreamProxy.port}`);
+      };
+
+      upstreamSocket.on('data', onUpstreamData);
+    });
+
+    upstreamSocket.setTimeout(config.requestTimeoutMs, () => {
+      upstreamSocket.destroy(new Error('CONNECT tunnel timed out'));
+    });
+
+    upstreamSocket.on('error', (err) => {
+      if (settled) {
+        if (!clientSocket.destroyed) {
+          clientSocket.destroy();
+        }
+        return;
+      }
+      settled = true;
+      healthTracker.markFailure(raw, err.message);
+      log.error(`CONNECT error via ${upstreamProxy.host}:${upstreamProxy.port} for ${target.host}:${target.port}: ${err.message}`);
+      tryNext();
+    });
+
+    clientSocket.once('error', () => {
+      upstreamSocket.destroy();
+    });
+  }
+
+  tryNext();
+}
+
 /**
  * Create a configured Node.js HTTP proxy server supporting reverse proxy,
  * optional forward proxy (`ENABLE_FORWARD_PROXY=true`), WebSocket upgrades,
@@ -311,29 +570,110 @@ function parseAuthority(authority) {
 export function createProxyServer(initialConfig, logger = console, options = {}) {
   let activeConfig = initialConfig;
   let upstreamIndex = 0;
+  const upstreamHealth = new Map();
   const log = {
     info: logger.info ?? (() => {}),
     error: logger.error ?? (() => {}),
   };
 
-  function pickUpstreamProxy() {
+  const healthTracker = {
+    markFailure(proxy, reason) {
+      const key = formatUpstreamProxy(proxy);
+      const prev = upstreamHealth.get(key) ?? { failures: 0, cooldownUntil: 0, lastError: null };
+      upstreamHealth.set(key, {
+        failures: prev.failures + 1,
+        cooldownUntil: Date.now() + UPSTREAM_COOLDOWN_MS,
+        lastError: reason,
+      });
+    },
+    markSuccess(proxy) {
+      const key = formatUpstreamProxy(proxy);
+      if (upstreamHealth.has(key)) {
+        upstreamHealth.set(key, { failures: 0, cooldownUntil: 0, lastError: null });
+      }
+    },
+  };
+
+  function resolveProxyTemplate(proxy, country) {
+    const countryVal = country ? country.toLowerCase() : '';
+    const sessionVal = randomBytes(4).toString('hex');
+    const expand = (val) =>
+      val === null
+        ? null
+        : val.replace(/\{country\}/gi, countryVal).replace(/\{session\}/gi, sessionVal);
+
+    return {
+      ...proxy,
+      username: expand(proxy.username),
+      password: expand(proxy.password),
+    };
+  }
+
+  function pickUpstreamCandidates(country = '') {
     const list = activeConfig.upstreamProxies;
-    if (!list || list.length === 0) return null;
-    const chosen = list[upstreamIndex % list.length];
+    if (!list || list.length === 0) return [];
+
+    let pool = list;
+    const normalizedCountry = country.trim().toUpperCase();
+    if (normalizedCountry) {
+      const matched = list.filter(
+        (p) =>
+          p.country === normalizedCountry ||
+          p.username?.includes('{country}') ||
+          p.password?.includes('{country}')
+      );
+      pool = matched.length > 0 ? matched : list.filter((p) => !p.country);
+      if (pool.length === 0) return [];
+    }
+
+    const start = upstreamIndex % pool.length;
     upstreamIndex = (upstreamIndex + 1) % list.length;
-    return chosen;
+    const rotated = [...pool.slice(start), ...pool.slice(0, start)];
+
+    const now = Date.now();
+    const healthy = [];
+    const cooling = [];
+    for (const p of rotated) {
+      const state = upstreamHealth.get(formatUpstreamProxy(p));
+      if (state && state.cooldownUntil > now) {
+        cooling.push(p);
+      } else {
+        healthy.push(p);
+      }
+    }
+
+    return [...healthy, ...cooling].map((p) => ({
+      raw: p,
+      resolved: resolveProxyTemplate(p, normalizedCountry),
+    }));
   }
 
   const server = http.createServer(async (req, res) => {
     const rawUrl = req.url ?? '/';
 
     if (req.method === 'GET' && rawUrl === '/health') {
+      const now = Date.now();
+      const total = activeConfig.upstreamProxies.length;
+      let coolingDown = 0;
+      for (const p of activeConfig.upstreamProxies) {
+        const state = upstreamHealth.get(formatUpstreamProxy(p));
+        if (state && state.cooldownUntil > now) coolingDown++;
+      }
       const payload = JSON.stringify({
         status: 'ok',
         mode: {
           reverseProxy: Boolean(activeConfig.targetUrl),
           forwardProxy: activeConfig.enableForwardProxy,
         },
+        ...(total > 0
+          ? {
+              upstreamHealth: {
+                total,
+                healthy: total - coolingDown,
+                coolingDown,
+              },
+            }
+          : {}),
       });
       res.writeHead(200, {
         'content-type': 'application/json; charset=utf-8',
@@ -393,12 +733,32 @@ export function createProxyServer(initialConfig, logger = console, options = {})
             Number(body.port ?? activeConfig.port) !== activeConfig.port ||
             String(body.host ?? activeConfig.host) !== activeConfig.host;
 
+          let nextUpstreamProxies = body.upstreamProxies;
+          if (nextUpstreamProxies !== undefined) {
+            const parsedIncoming = parseUpstreamProxies(nextUpstreamProxies);
+            nextUpstreamProxies = parsedIncoming.map((incoming) => {
+              if (incoming.password !== '***') {
+                return formatUpstreamProxy(incoming);
+              }
+              const existing = activeConfig.upstreamProxies.find(
+                (p) =>
+                  p.protocol === incoming.protocol &&
+                  p.host === incoming.host &&
+                  p.port === incoming.port &&
+                  p.username === incoming.username &&
+                  p.country === incoming.country
+              );
+              return formatUpstreamProxy(existing ?? incoming);
+            });
+          }
+
           activeConfig = saveConfig(
             {
               ...body,
               proxyUsername: nextProxyUsername,
               proxyPassword: nextProxyPassword,
               adminPassword: nextAdminPassword,
+              ...(nextUpstreamProxies !== undefined ? { upstreamProxies: nextUpstreamProxies } : {}),
             },
             { configPath: options.configPath }
           );
@@ -457,9 +817,23 @@ export function createProxyServer(initialConfig, logger = console, options = {})
         return;
       }
 
+      const requestedCountry = typeof req.headers['x-proxy-country'] === 'string'
+        ? req.headers['x-proxy-country'].trim()
+        : '';
+      const candidates = pickUpstreamCandidates(requestedCountry);
+      if (requestedCountry && activeConfig.upstreamProxies.length > 0 && candidates.length === 0) {
+        sendJsonError(res, 502, `No upstream proxy available for country: ${requestedCountry}`);
+        return;
+      }
+
       const headers = stripHopByHopHeaders(req.headers);
+      delete headers['x-proxy-country'];
       headers.host = destinationUrl.host;
-      forwardRequest(req, res, destinationUrl, headers, activeConfig, log, pickUpstreamProxy());
+      if (candidates.length > 0) {
+        forwardViaUpstreamPool(req, res, destinationUrl, headers, activeConfig, log, candidates, healthTracker);
+      } else {
+        forwardRequest(req, res, destinationUrl, headers, activeConfig, log);
+      }
       return;
     }
 
@@ -510,60 +884,29 @@ export function createProxyServer(initialConfig, logger = console, options = {})
       return;
     }
 
-    const upstreamProxy = pickUpstreamProxy();
-    const connectHost = upstreamProxy ? upstreamProxy.host : target.host;
-    const connectPort = upstreamProxy ? upstreamProxy.port : target.port;
+    const requestedCountry = typeof req.headers['x-proxy-country'] === 'string'
+      ? req.headers['x-proxy-country'].trim()
+      : '';
+    const candidates = pickUpstreamCandidates(requestedCountry);
+    if (requestedCountry && activeConfig.upstreamProxies.length > 0 && candidates.length === 0) {
+      clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
 
-    const upstreamSocket = net.connect(connectPort, connectHost, () => {
-      if (!upstreamProxy) {
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        if (head && head.length > 0) {
-          upstreamSocket.write(head);
-        }
-        upstreamSocket.pipe(clientSocket);
-        clientSocket.pipe(upstreamSocket);
-        log.info(`CONNECT ${target.host}:${target.port}`);
-        return;
+    if (candidates.length > 0) {
+      connectViaUpstreamPool(target, clientSocket, head, candidates, activeConfig, log, healthTracker);
+      return;
+    }
+
+    const upstreamSocket = net.connect({ host: target.host, port: target.port }, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head && head.length > 0) {
+        upstreamSocket.write(head);
       }
-
-      // Chain CONNECT through the selected upstream HTTP proxy
-      upstreamSocket.write(
-        `CONNECT ${target.host}:${target.port} HTTP/1.1\r\nHost: ${target.host}:${target.port}\r\n\r\n`
-      );
-
-      let responseBuffer = Buffer.alloc(0);
-      const onUpstreamData = (chunk) => {
-        responseBuffer = Buffer.concat([responseBuffer, chunk]);
-        const headerEnd = responseBuffer.indexOf('\r\n\r\n');
-        if (headerEnd === -1) return;
-
-        upstreamSocket.removeListener('data', onUpstreamData);
-        const headerText = responseBuffer.subarray(0, headerEnd).toString('utf8');
-        const statusLine = headerText.split('\r\n')[0] ?? '';
-        const statusCode = Number.parseInt(statusLine.split(' ')[1] ?? '0', 10);
-
-        if (statusCode !== 200) {
-          log.error(`Upstream proxy ${upstreamProxy.host}:${upstreamProxy.port} rejected CONNECT (${statusLine})`);
-          clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-          clientSocket.destroy();
-          upstreamSocket.destroy();
-          return;
-        }
-
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        const leftover = responseBuffer.subarray(headerEnd + 4);
-        if (leftover.length > 0) {
-          clientSocket.write(leftover);
-        }
-        if (head && head.length > 0) {
-          upstreamSocket.write(head);
-        }
-        upstreamSocket.pipe(clientSocket);
-        clientSocket.pipe(upstreamSocket);
-        log.info(`CONNECT ${target.host}:${target.port} via ${upstreamProxy.host}:${upstreamProxy.port}`);
-      };
-
-      upstreamSocket.on('data', onUpstreamData);
+      upstreamSocket.pipe(clientSocket);
+      clientSocket.pipe(upstreamSocket);
+      log.info(`CONNECT ${target.host}:${target.port}`);
     });
 
     upstreamSocket.setTimeout(activeConfig.requestTimeoutMs, () => {

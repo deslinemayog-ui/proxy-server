@@ -534,5 +534,262 @@ describe('proxy-server', () => {
       await close(up2);
     }
   });
+
+  it('forwards upstream Proxy-Authorization, expands {country}/{session}, and routes by X-Proxy-Country', async () => {
+    const observed = [];
+
+    function createAuthUpstream(name) {
+      const s = http.createServer((req, res) => {
+        observed.push({
+          name,
+          type: 'http',
+          auth: req.headers['proxy-authorization'] ?? null,
+          leakedCountryHeader: req.headers['x-proxy-country'] ?? null,
+        });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ via: name, auth: req.headers['proxy-authorization'] ?? null }));
+      });
+      s.on('connect', (req, clientSocket) => {
+        observed.push({
+          name,
+          type: 'connect',
+          auth: req.headers['proxy-authorization'] ?? null,
+        });
+        const [host, port] = req.url.split(':');
+        const targetSocket = net.connect(Number(port), host, () => {
+          clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          targetSocket.pipe(clientSocket);
+          clientSocket.pipe(targetSocket);
+        });
+        targetSocket.on('error', () => clientSocket.destroy());
+      });
+      return s;
+    }
+
+    const usProxy = createAuthUpstream('us');
+    const gbGateway = createAuthUpstream('gb-gate');
+    const usPort = await listen(usProxy);
+    const gbPort = await listen(gbGateway);
+
+    const config = loadConfig({
+      PORT: '0',
+      ENABLE_FORWARD_PROXY: 'true',
+      UPSTREAM_PROXIES: [
+        `http://ususer:uspass@127.0.0.1:${usPort}#US`,
+        `http://user-{country}-{session}:secret@127.0.0.1:${gbPort}`,
+      ].join(','),
+    });
+    const proxy = createProxyServer(config, silentLogger);
+    const proxyPort = await listen(proxy);
+
+    const sendHttp = (headers = {}) =>
+      new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            host: '127.0.0.1',
+            port: proxyPort,
+            method: 'GET',
+            path: 'http://example.test/check',
+            headers,
+          },
+          (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString()) }));
+          }
+        );
+        req.on('error', reject);
+        req.end();
+      });
+
+    try {
+      // Request targeting US should hit usProxy with Basic ususer:uspass and strip X-Proxy-Country
+      const usRes = await sendHttp({ 'x-proxy-country': 'US' });
+      assert.equal(usRes.status, 200);
+      assert.equal(usRes.body.via, 'us');
+      assert.equal(
+        usRes.body.auth,
+        `Basic ${Buffer.from('ususer:uspass').toString('base64')}`
+      );
+      assert.equal(observed[0].leakedCountryHeader, null);
+
+      // Request targeting DE matches the untagged {country}/{session} gateway template
+      const deRes = await sendHttp({ 'x-proxy-country': 'DE' });
+      assert.equal(deRes.status, 200);
+      assert.equal(deRes.body.via, 'gb-gate');
+      const decodedDeAuth = Buffer.from(deRes.body.auth.replace('Basic ', ''), 'base64').toString('utf8');
+      assert.match(decodedDeAuth, /^user-de-[0-9a-f]{8}:secret$/);
+
+      // CONNECT targeting US should also send Proxy-Authorization to usProxy
+      const tunnelOut = await new Promise((resolve, reject) => {
+        const socket = net.connect(proxyPort, '127.0.0.1', () => {
+          socket.write(
+            `CONNECT 127.0.0.1:${upstreamPort} HTTP/1.1\r\nHost: 127.0.0.1:${upstreamPort}\r\nX-Proxy-Country: US\r\n\r\n`
+          );
+        });
+        let established = false;
+        let buf = '';
+        socket.on('data', (chunk) => {
+          buf += chunk.toString('utf8');
+          if (!established && buf.includes('\r\n\r\n')) {
+            established = true;
+            buf = '';
+            socket.write(`GET /us-tunnel HTTP/1.1\r\nHost: 127.0.0.1:${upstreamPort}\r\nConnection: close\r\n\r\n`);
+          } else if (established && buf.includes('"url":"/us-tunnel"')) {
+            socket.end();
+            resolve(buf);
+          }
+        });
+        socket.on('error', reject);
+      });
+
+      assert.match(tunnelOut, /"url":"\/us-tunnel"/);
+      const connectHit = observed.find((o) => o.name === 'us' && o.type === 'connect');
+      assert.equal(connectHit?.auth, `Basic ${Buffer.from('ususer:uspass').toString('base64')}`);
+    } finally {
+      await close(proxy);
+      await close(usProxy);
+      await close(gbGateway);
+    }
+  });
+
+  it('masks upstream proxy passwords in /api/config and preserves them when saved back masked', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'proxy-upstream-mask-'));
+    const configPath = join(tempDir, 'config.json');
+    const config = loadConfig({
+      PORT: '0',
+      ENABLE_FORWARD_PROXY: 'true',
+      UPSTREAM_PROXIES: 'https://alice:topsecret@gate.example.com:443#US',
+    });
+    const proxy = createProxyServer(config, silentLogger, { configPath });
+    const port = await listen(proxy);
+
+    try {
+      const getRes = await fetch(`http://127.0.0.1:${port}/api/config`);
+      assert.equal(getRes.status, 200);
+      const uiCfg = await getRes.json();
+      assert.deepEqual(uiCfg.upstreamProxies, ['https://alice:***@gate.example.com:443#US']);
+
+      const postRes = await fetch(`http://127.0.0.1:${port}/api/config`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          ...uiCfg,
+          upstreamProxies: uiCfg.upstreamProxies.join('\n'),
+        }),
+      });
+      assert.equal(postRes.status, 200);
+
+      const reloaded = loadConfig(process.env, { configPath });
+      assert.equal(reloaded.upstreamProxies[0].protocol, 'https:');
+      assert.equal(reloaded.upstreamProxies[0].username, 'alice');
+      assert.equal(reloaded.upstreamProxies[0].password, 'topsecret');
+      assert.equal(reloaded.upstreamProxies[0].country, 'US');
+    } finally {
+      await close(proxy);
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails over across upstreamProxies on HTTP 407/connection errors and tracks cooldown in /health', async () => {
+    // Get an unused port to simulate a dead upstream proxy
+    const deadServer = http.createServer();
+    const deadPort = await listen(deadServer);
+    await close(deadServer);
+
+    let healthyHits = 0;
+    const healthyProxy = http.createServer((req, res) => {
+      healthyHits++;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, hit: healthyHits }));
+    });
+    healthyProxy.on('connect', (req, clientSocket) => {
+      healthyHits++;
+      const [host, port] = req.url.split(':');
+      const targetSocket = net.connect(Number(port), host, () => {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        targetSocket.pipe(clientSocket);
+        clientSocket.pipe(targetSocket);
+      });
+      targetSocket.on('error', () => clientSocket.destroy());
+    });
+    const healthyPort = await listen(healthyProxy);
+
+    const rejectingProxy = http.createServer((req, res) => {
+      res.writeHead(407, { 'content-type': 'text/plain' });
+      res.end('Proxy Auth Required');
+    });
+    rejectingProxy.on('connect', (req, clientSocket) => {
+      clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      clientSocket.destroy();
+    });
+    const rejectingPort = await listen(rejectingProxy);
+
+    const config = loadConfig({
+      PORT: '0',
+      ENABLE_FORWARD_PROXY: 'true',
+      UPSTREAM_PROXIES: `127.0.0.1:${deadPort},127.0.0.1:${rejectingPort},127.0.0.1:${healthyPort}`,
+    });
+    const proxy = createProxyServer(config, silentLogger);
+    const proxyPort = await listen(proxy);
+
+    const sendHttp = () =>
+      new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            host: '127.0.0.1',
+            port: proxyPort,
+            method: 'GET',
+            path: 'http://example.test/failover',
+          },
+          (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString()) }));
+          }
+        );
+        req.on('error', reject);
+        req.end();
+      });
+
+    try {
+      const r1 = await sendHttp();
+      assert.equal(r1.status, 200);
+      assert.equal(r1.body.ok, true);
+
+      const healthRes = await fetch(`http://127.0.0.1:${proxyPort}/health`);
+      const health = await healthRes.json();
+      assert.equal(health.upstreamHealth.total, 3);
+      assert.equal(health.upstreamHealth.coolingDown, 2);
+      assert.equal(health.upstreamHealth.healthy, 1);
+
+      // CONNECT should also fail over to healthyProxy
+      const tunnelOut = await new Promise((resolve, reject) => {
+        const socket = net.connect(proxyPort, '127.0.0.1', () => {
+          socket.write(`CONNECT 127.0.0.1:${upstreamPort} HTTP/1.1\r\nHost: 127.0.0.1:${upstreamPort}\r\n\r\n`);
+        });
+        let established = false;
+        let buf = '';
+        socket.on('data', (chunk) => {
+          buf += chunk.toString('utf8');
+          if (!established && buf.includes('\r\n\r\n')) {
+            established = true;
+            buf = '';
+            socket.write(`GET /failover-tunnel HTTP/1.1\r\nHost: 127.0.0.1:${upstreamPort}\r\nConnection: close\r\n\r\n`);
+          } else if (established && buf.includes('"url":"/failover-tunnel"')) {
+            socket.end();
+            resolve(buf);
+          }
+        });
+        socket.on('error', reject);
+      });
+      assert.match(tunnelOut, /"url":"\/failover-tunnel"/);
+      assert.equal(healthyHits, 2);
+    } finally {
+      await close(proxy);
+      await close(healthyProxy);
+      await close(rejectingProxy);
+    }
+  });
 });
 
